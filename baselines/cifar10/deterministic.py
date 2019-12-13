@@ -13,13 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ResNet-32x4 on CIFAR-10 trained with maximum likelihood and gradient descent.
+"""Wide ResNet 28-10 on CIFAR-10 trained with maximum likelihood.
+
+Hyperparameters such as learning rate schedule differ slightly from
+the original paper's code
+(https://github.com/szagoruyko/wide-residual-networks). We use large batch sizes
+in order to speed up training with many more GPU/TPUs. We also use l2 instead of
+weight decay as weight decay is more difficult to implement in TensorFlow.
 """
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
 import os
 import time
 from absl import app
@@ -35,9 +42,16 @@ import tensorflow_datasets as tfds
 
 flags.DEFINE_integer('seed', 42, 'Random seed.')
 flags.DEFINE_integer('per_core_batch_size', 64, 'Batch size per TPU core/GPU.')
-flags.DEFINE_float('base_learning_rate', 0.1,
-                   'Base learning rate when total training batch size is 128.')
-flags.DEFINE_float('l2', 2e-4, 'L2 regularization coefficient.')
+flags.DEFINE_float('base_learning_rate', 0.075,
+                   'Base learning rate when total batch size is 128. It is '
+                   'scaled by the ratio of the total batch size to 128.')
+flags.DEFINE_integer('lr_warmup_epochs', 5,
+                     'Number of epochs for a linear warmup to the initial '
+                     'learning rate. Use 0 to do no warmup.')
+flags.DEFINE_float('lr_decay_ratio', 0.2, 'Amount to decay learning rate.')
+flags.DEFINE_list('lr_decay_epochs', [60, 120, 160],
+                  'Epochs to decay learning rate by.')
+flags.DEFINE_float('l2', 1e-4, 'L2 regularization coefficient.')
 flags.DEFINE_string('dataset', 'cifar10', 'Dataset: cifar10 or cifar100.')
 flags.DEFINE_string('output_dir', '/tmp/cifar', 'Output directory.')
 flags.DEFINE_integer('train_epochs', 200, 'Number of training epochs.')
@@ -45,104 +59,94 @@ flags.DEFINE_integer('train_epochs', 200, 'Number of training epochs.')
 # Accelerator flags.
 flags.DEFINE_bool('use_gpu', False, 'Whether to run on GPU or otherwise TPU.')
 flags.DEFINE_bool('use_bfloat16', False, 'Whether to use mixed precision.')
-flags.DEFINE_integer('num_cores', 8, 'Number of TPU cores or number of GPUs.')
+flags.DEFINE_integer('num_cores', 32, 'Number of TPU cores or number of GPUs.')
 flags.DEFINE_string('tpu', None,
                     'Name of the TPU. Only used if use_gpu is False.')
 FLAGS = flags.FLAGS
 
-_LR_SCHEDULE = [    # (multiplier, epoch to start) tuples
-    (1.0, 1), (0.1, 80), (0.01, 160), (0.001, 180)
-]
+Conv2D = functools.partial(  # pylint: disable=invalid-name
+    tf.keras.layers.Conv2D,
+    kernel_size=3,
+    padding='same',
+    use_bias=False,
+    kernel_initializer='he_normal',
+    kernel_regularizer=tf.keras.regularizers.l2(FLAGS.l2))
 
 
-def resnet_layer(inputs,
-                 filters,
-                 kernel_size=3,
-                 strides=1,
-                 activation=None,
-                 l2=0.):
-  """2D Convolution-Batch Normalization-Activation stack builder.
+def basic_block(inputs, filters, strides):
+  """Basic residual block of two 3x3 convs.
 
   Args:
     inputs: tf.Tensor.
     filters: Number of filters for Conv2D.
-    kernel_size: Kernel dimensions for Conv2D.
-    strides: Stride dimensinons for Conv2D.
-    activation: tf.keras.activations.Activation.
-    l2: L2 regularization coefficient.
+    strides: Stride dimensions for Conv2D.
 
   Returns:
     tf.Tensor.
   """
   x = inputs
-  logging.info('Applying conv layer.')
-  x = tf.keras.layers.Conv2D(
-      filters,
-      kernel_size=kernel_size,
-      strides=strides,
-      padding='same',
-      kernel_initializer='he_normal',
-      kernel_regularizer=tf.keras.regularizers.l2(l2),
-      bias_regularizer=tf.keras.regularizers.l2(l2))(x)
-  x = tf.keras.layers.BatchNormalization(epsilon=1e-5,
-                                         momentum=0.9)(x)
-  if activation is not None:
-    x = tf.keras.layers.Activation(activation)(x)
+  # Note using epsilon and momentum defaults from Torch which WRN paper used.
+  y = tf.keras.layers.BatchNormalization(epsilon=1e-5, momentum=0.9)(x)
+  y = tf.keras.layers.Activation('relu')(y)
+  y = Conv2D(filters, strides=strides)(y)
+  y = tf.keras.layers.BatchNormalization(epsilon=1e-5, momentum=0.9)(y)
+  y = tf.keras.layers.Activation('relu')(y)
+  y = Conv2D(filters, strides=1)(y)
+  if not x.shape.is_compatible_with(y.shape):
+    x = Conv2D(filters, kernel_size=1, strides=strides)(x)
+  x = tf.keras.layers.add([x, y])
   return x
 
 
-def resnet_v1(input_shape, depth, width_multiplier, num_classes, l2):
-  """Builds ResNet v1.
+def group(inputs, filters, strides, num_blocks):
+  """Group of residual blocks.
+
+  Args:
+    inputs: tf.Tensor.
+    filters: Number of filters for Conv2D.
+    strides: Stride dimensions for Conv2D.
+    num_blocks: Number of residual blocks.
+
+  Returns:
+    tf.Tensor.
+  """
+  x = basic_block(inputs, filters=filters, strides=strides)
+  for _ in range(num_blocks - 1):
+    x = basic_block(x, filters=filters, strides=1)
+  return x
+
+
+def wide_resnet(input_shape, depth, width_multiplier, num_classes, l2):
+  """Builds Wide ResNet.
+
+  Following Zagoruyko and Komodakis (2016), it uses the preactivation ResNet
+  ordering (He et al., 2016) and accepts a width multiplier on the number of
+  filters. Using three groups of residual blocks, the network maps spatial
+  features of size 32x32 -> 16x16 -> 8x8.
 
   Args:
     input_shape: tf.Tensor.
-    depth: ResNet depth.
-    width_multiplier: Integer to multiply the number of typical filters by.
+    depth: Total number of convolutional layers. "n" in WRN-n-k, as opposed to
+      the maximum depth of the network counting non-conv layers like dense as
+      with He et al. (2015).
+    width_multiplier: Integer to multiply the number of typical filters by. "k"
+      in WRN-n-k.
     num_classes: Number of output classes.
     l2: L2 regularization coefficient.
 
   Returns:
     tf.keras.Model.
   """
-  num_res_blocks = (depth - 2) // 6
-  filters = 16 * width_multiplier
-  if (depth - 2) % 6 != 0:
-    raise ValueError('depth must be 6n+2 (e.g. 20, 32, 44).')
-
-  logging.info('Starting ResNet build.')
+  if (depth - 4) % 6 != 0:
+    raise ValueError('depth should be 6n+4 (e.g., 16, 22, 28, 40).')
+  num_blocks = (depth - 4) // 6
   inputs = tf.keras.layers.Input(shape=input_shape)
-  x = resnet_layer(inputs,
-                   filters=filters,
-                   activation='relu',
-                   l2=l2)
-  for stack in range(3):
-    for res_block in range(num_res_blocks):
-      logging.info('Starting ResNet stack #%d block #%d.', stack, res_block)
-      strides = 1
-      if stack > 0 and res_block == 0:  # first layer but not first stack
-        strides = 2  # downsample
-      y = resnet_layer(x,
-                       filters=filters,
-                       strides=strides,
-                       activation='relu',
-                       l2=l2)
-      y = resnet_layer(y,
-                       filters=filters,
-                       activation=None,
-                       l2=l2)
-      if stack > 0 and res_block == 0:  # first layer but not first stack
-        # linear projection residual shortcut connection to match changed dims
-        x = resnet_layer(x,
-                         filters=filters,
-                         kernel_size=1,
-                         strides=strides,
-                         activation=None,
-                         l2=l2)
-      x = tf.keras.layers.add([x, y])
-      x = tf.keras.layers.Activation('relu')(x)
-    filters *= 2
-
-  # v1 does not use BN after last shortcut connection-ReLU
+  x = Conv2D(16, strides=1)(inputs)
+  x = group(x, filters=16 * width_multiplier, strides=1, num_blocks=num_blocks)
+  x = group(x, filters=32 * width_multiplier, strides=2, num_blocks=num_blocks)
+  x = group(x, filters=64 * width_multiplier, strides=2, num_blocks=num_blocks)
+  x = tf.keras.layers.BatchNormalization(epsilon=1e-5, momentum=0.9)(x)
+  x = tf.keras.layers.Activation('relu')(x)
   x = tf.keras.layers.AveragePooling2D(pool_size=8)(x)
   x = tf.keras.layers.Flatten()(x)
   x = tf.keras.layers.Dense(
@@ -150,7 +154,7 @@ def resnet_v1(input_shape, depth, width_multiplier, num_classes, l2):
       kernel_initializer='he_normal',
       kernel_regularizer=tf.keras.regularizers.l2(l2),
       bias_regularizer=tf.keras.regularizers.l2(l2))(x)
-  return tf.keras.models.Model(inputs=inputs, outputs=x)
+  return tf.keras.Model(inputs=inputs, outputs=x)
 
 
 def main(argv):
@@ -210,19 +214,26 @@ def main(argv):
     tf.keras.mixed_precision.experimental.set_policy(policy)
 
   with strategy.scope():
-    logging.info('Building Keras ResNet-32 model')
-    model = resnet_v1(input_shape=ds_info.features['image'].shape,
-                      depth=32,
-                      num_classes=ds_info.features['label'].num_classes,
-                      width_multiplier=4,
-                      l2=FLAGS.l2)
+    logging.info('Building ResNet model')
+    model = wide_resnet(input_shape=ds_info.features['image'].shape,
+                        depth=28,
+                        width_multiplier=10,
+                        num_classes=ds_info.features['label'].num_classes,
+                        l2=FLAGS.l2)
     logging.info('Model input shape: %s', model.input_shape)
     logging.info('Model output shape: %s', model.output_shape)
     logging.info('Model number of weights: %s', model.count_params())
     base_lr = FLAGS.base_learning_rate * batch_size / 128
-    lr_schedule = utils.ResnetLearningRateSchedule(steps_per_epoch,
-                                                   base_lr,
-                                                   _LR_SCHEDULE)
+    # TODO(trandustin):
+    lr_decay_epochs = [np.floor(FLAGS.train_epochs / 200 * start_epoch)
+                       for start_epoch in FLAGS.lr_decay_epochs]
+    lr_schedule = utils.LearningRateSchedule(
+        steps_per_epoch,
+        base_lr,
+        decay_ratio=FLAGS.lr_decay_ratio,
+        # decay_epochs=FLAGS.lr_decay_epochs,
+        decay_epochs=lr_decay_epochs,
+        warmup_epochs=FLAGS.lr_warmup_epochs)
     optimizer = tf.keras.optimizers.SGD(lr_schedule,
                                         momentum=0.9,
                                         nesterov=True)
